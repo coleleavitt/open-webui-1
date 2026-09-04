@@ -23,6 +23,8 @@ needs cleanup.  The session is closed once during application shutdown
 via ``close_session()``.
 """
 
+import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -116,6 +118,18 @@ async def cleanup_response(
                 await result
 
 
+def _sse_error_frames(exc: BaseException) -> bytes:
+    """In-band terminator for an SSE stream whose upstream failed after the
+    200 status line was already sent: an OpenAI-style error frame followed by
+    ``[DONE]`` so clients stop reading cleanly instead of seeing a bare EOF."""
+    error = {
+        'message': f'Upstream stream failed: {type(exc).__name__}: {exc}',
+        'type': 'upstream_error',
+        'code': 502,
+    }
+    return f'data: {json.dumps({"error": error})}\n\ndata: [DONE]\n\n'.encode()
+
+
 async def stream_wrapper(response, session=None, passthrough=False):
     """Wrap a stream to ensure cleanup happens even if streaming is interrupted.
 
@@ -125,6 +139,13 @@ async def stream_wrapper(response, session=None, passthrough=False):
     ``passthrough=True`` yields raw network chunks (iter_any) instead of
     lines: byte-identical output without a buffer scan, slice and copy per
     line. Only for streams no internal consumer parses line-by-line.
+
+    An upstream failure after the response headers were forwarded (reset,
+    payload error, idle timeout) cannot change the HTTP status any more;
+    raising out of the body iterator only makes the ASGI server drop the
+    connection, which clients see as a silent, successful-looking truncation.
+    For ``text/event-stream`` responses the failure is reported in band
+    instead, as an error frame followed by ``[DONE]``.
     """
     try:
         if passthrough:
@@ -133,5 +154,13 @@ async def stream_wrapper(response, session=None, passthrough=False):
             stream = stream_chunks_handler(response.content)
         async for chunk in stream:
             yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        raise
+    except Exception as e:
+        content_type = response.headers.get('Content-Type', '') if response is not None else ''
+        if 'text/event-stream' not in content_type:
+            raise
+        log.warning('Upstream event stream failed mid-response: %s: %s', type(e).__name__, e)
+        yield _sse_error_frames(e)
     finally:
         await cleanup_response(response, session)
